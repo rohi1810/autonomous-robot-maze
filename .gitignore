@@ -1,0 +1,13 @@
+# CLion
+.idea/
+cmake-build-*/
+
+# Build outputs
+build/
+*.exe
+*.o
+*.obj
+
+# OS
+.DS_Store
+Thumbs.db
