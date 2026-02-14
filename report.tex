@@ -1,0 +1,342 @@
+\documentclass[12pt,a4paper]{article}
+
+% ---------- Packages ----------
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{amsmath}
+\usepackage{amssymb}
+
+% ---------- Hyperref ----------
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  citecolor=blue
+}
+
+% ---------- Code listing style ----------
+\lstdefinestyle{cstyle}{
+  language=C,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue},
+  commentstyle=\color{gray},
+  stringstyle=\color{teal},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  stepnumber=1,
+  numbersep=6pt,
+  showstringspaces=false,
+  breaklines=true,
+  frame=single,
+  tabsize=2
+}
+
+\title{\textbf{Webots Autonomous Exploration and Target Navigation Report}\\
+\large (A* Path Planning + Frontier Exploration + Color-Pillar Targeting + Safety Manager)}
+
+\begin{document}
+\maketitle
+
+\tableofcontents
+\newpage
+
+% =========================================================
+% =========================================================
+\section{System Overview (Main Control Loop)}
+\textbf{Key functions:} \texttt{main()}, \texttt{while(wb\_robot\_step(...))}, \texttt{switch(state)}
+
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{Safety Update:} reads IR sensors and pitch, possibly stops motion and enters recovery.
+  \item \textbf{Mapping Update:} integrates LiDAR scans into an occupancy grid.
+  \item \textbf{Perception Update:} marks additional obstacles from camera-based green/red detection.
+  \item \textbf{Cost Map Update:} generates inflated costs based on obstacle distance (adaptive inflation).
+  \item \textbf{Visualization:} renders the map, frontiers, path, and safety status.
+  \item \textbf{State Machine:} selects between frontier exploration and target navigation (blue then yellow).
+\end{enumerate}
+
+% =========================================================
+\section{Data Structures and Global Maps}
+\textbf{Key functions:} \texttt{init\_grid()}, \texttt{world\_to\_grid()}, \texttt{is\_valid\_cell()}
+
+\subsection{Grid Representation}
+The environment is discretized into a 2D grid with resolution \texttt{GRID\_RESOLUTION} (meters per cell).
+\begin{itemize}[leftmargin=2em]
+  \item \texttt{grid[y][x]}: cell type (unknown/free/obstacle/robot/blue pillar/yellow pillar)
+  \item \texttt{obstacle\_counter[y][x]} and \texttt{free\_counter[y][x]}: temporal filters for stability
+  \item \texttt{cost\_map[y][x]}: numeric planning cost used by A*
+  \item \texttt{frontier\_edge\_map[y][x]}: computed frontier edges for exploration
+\end{itemize}
+
+\subsection{Cell Types}
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Constant} & \textbf{Meaning} \\
+\midrule
+\texttt{CELL\_UNKNOWN} & Unknown/unobserved area \\
+\texttt{CELL\_FREE} & Traversable space \\
+\texttt{CELL\_OBSTACLE} & Blocked cell (LiDAR/camera/safety marked) \\
+\texttt{CELL\_BLUE\_PILLAR} & Blue target marker in grid \\
+\texttt{CELL\_YELLOW\_PILLAR} & Yellow target marker in grid \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% =========================================================
+\section{A* Path Planning Implementation}
+\textbf{Key functions:} \texttt{ASPathCreate()}, \texttt{ASNeighborListAdd()}, \texttt{ASPathGetNode()},
+\texttt{find\_path\_astar()}, \texttt{destroy\_grid\_path()}
+
+\subsection{Generic A* Engine}
+The controller contains a standalone A* implementation that is decoupled from Webots. The A* engine uses callbacks to:
+\begin{itemize}[leftmargin=2em]
+  \item fetch neighbor nodes,
+  \item compute heuristic cost,
+  \item compare node keys,
+  \item optionally early-exit if too many nodes are expanded.
+\end{itemize}
+
+\subsection{Grid-Specific A* Callbacks}
+\textbf{Key functions:} \texttt{grid\_node\_neighbors()}, \texttt{grid\_path\_cost\_heuristic()},
+\texttt{grid\_node\_comparator()}, \texttt{grid\_early\_exit()}
+
+\begin{itemize}[leftmargin=2em]
+  \item \texttt{grid\_node\_neighbors()}: expands 8-connected neighbors. Each edge cost is scaled by the target cell's cost from \texttt{cost\_map}.
+  \item \texttt{grid\_path\_cost\_heuristic()}: Euclidean distance (admissible heuristic in grid).
+  \item \texttt{grid\_node\_comparator()}: deterministic ordering by \texttt{(y,x)}.
+  \item \texttt{grid\_early\_exit()}: stops if visited nodes exceed a threshold (prevents long stalls).
+\end{itemize}
+
+\subsection{Planning}
+\texttt{find\_path\_astar()} converts start/goal grid cells into an \texttt{ASPath} and then stores the resulting sequence into \texttt{GridPath} (array of waypoints).
+
+% =========================================================
+\section{Mapping with LiDAR}
+\textbf{Key functions:} \texttt{process\_lidar()}, \texttt{draw\_line\_on\_grid()},
+\texttt{decay\_counters()}, \texttt{filter\_connected\_components()},
+\texttt{should\_integrate\_lidar()}
+
+\subsection{LiDAR Integration}
+\texttt{process\_lidar()} reads the LiDAR range image and for each ray:
+\begin{enumerate}[leftmargin=2em]
+  \item computes the ray angle relative to robot heading,
+  \item projects the measured endpoint to world coordinates,
+  \item converts world coordinates to grid coordinates,
+  \item draws the ray using \texttt{draw\_line\_on\_grid()}.
+\end{enumerate}
+
+\subsection{Ray Tracing and Temporal Filtering}
+\texttt{draw\_line\_on\_grid()} performs Bresenham-style ray tracing:
+\begin{itemize}[leftmargin=2em]
+  \item intermediate cells are reinforced as free (increase \texttt{free\_counter}),
+  \item endpoint cell is reinforced as obstacle (increase \texttt{obstacle\_counter}),
+  \item \textbf{pillar cells are protected} (LiDAR cannot overwrite \texttt{CELL\_BLUE\_PILLAR} or \texttt{CELL\_YELLOW\_PILLAR}).
+\end{itemize}
+
+\subsection{LiDAR Updates During Unstable Motion}
+\texttt{should\_integrate\_lidar()} can disable LiDAR integration when yaw rate is high or pitch is abnormal. This reduces mapping corruption while rotating quickly or climbing.
+
+\subsection{Noise Decay and Blob Filtering}
+\begin{itemize}[leftmargin=2em]
+  \item \texttt{decay\_counters()}: decreases confidence over time to remove stale false obstacles.
+  \item \texttt{filter\_connected\_components()}: removes small isolated obstacle blobs (noise).
+\end{itemize}
+
+% =========================================================
+\section{Cost Map Generation and Obstacle Inflation}
+\textbf{Key function:} \texttt{generate\_cost\_map()}
+
+The controller generates a distance transform from obstacles and then assigns traversal costs:
+\begin{itemize}[leftmargin=2em]
+  \item Obstacles $\rightarrow$ very high cost
+  \item Unknown cells $\rightarrow$ medium cost (discourage but allow exploration if necessary)
+  \item Free cells $\rightarrow$ low cost
+  \item Near obstacles $\rightarrow$ inflated cost band (safety buffer)
+\end{itemize}
+
+\subsection{Adaptive Inflation}
+Within \texttt{generate\_cost\_map()}, the controller samples local clearance around the robot and adjusts inflation:
+\begin{itemize}[leftmargin=2em]
+  \item \textbf{Tight space:} smaller inflation to fit corridors
+  \item \textbf{Open space:} larger inflation to maximize safety
+\end{itemize}
+This adaptive behavior reduces deadlocks due to overly conservative inflation in narrow mazes.
+
+% =========================================================
+\section{Frontier-Based Exploration}
+\textbf{Key functions:} \texttt{is\_frontier\_edge()}, \texttt{build\_frontier\_edge\_map()},
+\texttt{find\_frontier\_centroids()}, \texttt{update\_path\_to\_frontier()},
+\texttt{is\_failed\_frontier()}, \texttt{mark\_failed\_frontier()}
+
+\subsection{Frontier Definition}
+A frontier cell is a \texttt{CELL\_FREE} cell that is adjacent to at least one \texttt{CELL\_UNKNOWN} cell. These frontiers represent boundaries between known and unknown space.
+
+\subsection{Frontier Clustering and Scoring}
+\texttt{find\_frontier\_centroids()}:
+\begin{enumerate}[leftmargin=2em]
+  \item builds a binary frontier edge map,
+  \item clusters connected frontier edge cells into components,
+  \item computes centroid and size of each component,
+  \item scores candidates by size and distance,
+  \item sorts by score and returns the best candidates.
+\end{enumerate}
+
+\subsection{Failed Frontier Cache}
+\texttt{update\_path\_to\_frontier()} tries frontiers in descending score order. If a frontier is unreachable by A*, it is stored in a TTL cache using \texttt{mark\_failed\_frontier()} to prevent repeated wasted replanning.
+
+% =========================================================
+\section{Perception (Formulas from Code)}
+\textbf{Key functions:} \texttt{detect\_green\_to\_grid()}, \texttt{detect\_red\_to\_grid()}, \texttt{world\_to\_grid()}, \texttt{depth\_at\_centroid()}
+
+This module converts camera detections (green/red pixels) into obstacle cells in the grid. The pipeline is:
+\[
+\text{pixel }(x,y)\ \rightarrow\ \text{bearing }\beta\ \rightarrow\ \text{world point }(w_x,w_y)\ \rightarrow\ \text{grid cell }(g_x,g_y)
+\]
+
+\subsection{Pixel $\rightarrow$ Bearing (from code)}
+\textbf{Used in:} \texttt{detect\_green\_to\_grid()}, \texttt{detect\_red\_to\_grid()}
+\[
+\beta(x)= -\Big(x-\frac{w}{2}\Big)\cdot \frac{\mathrm{FOV}_h}{w}
+\]
+where $w$ is image width and $\mathrm{FOV}_h$ is horizontal FOV (e.g., 1.04 rad in code).
+
+\subsection{Bearing $\rightarrow$ World Projection (from code)}
+\textbf{Used in:} \texttt{detect\_green\_to\_grid()}, \texttt{detect\_red\_to\_grid()}
+\[
+\alpha = \theta + \beta
+\]
+\[
+w_x = r_x + d\cos(\alpha),\qquad w_y = r_y + d\sin(\alpha)
+\]
+where $(r_x,r_y)$ is robot position, $\theta$ is robot yaw, and $d$ is depth (meters) scaled by \texttt{distance\_scale}.
+
+\subsection{RGB Pixel $\rightarrow$ Depth Pixel Mapping (from code)}
+\textbf{Used in:} \texttt{detect\_green\_to\_grid()}, \texttt{detect\_red\_to\_grid()}
+\[
+x_d=\mathrm{round}\Big(x\cdot \frac{d_w-1}{w-1}\Big),\qquad
+y_d=\mathrm{round}\Big(y\cdot \frac{d_h-1}{h-1}\Big)
+\]
+Then depth is taken robustly as the \textbf{median} of a $3\times3$ neighborhood around $(x_d,y_d)$ (as implemented in code).
+
+\subsection{World $\rightarrow$ Grid (from code)}
+\textbf{Function:} \texttt{world\_to\_grid()}
+\[
+g_x=\Big\lfloor \frac{w_x}{\mathrm{RES}}+\frac{N}{2}\Big\rfloor,\qquad
+g_y=\Big\lfloor \frac{w_y}{\mathrm{RES}}+\frac{N}{2}\Big\rfloor
+\]
+where $\mathrm{RES}=\texttt{GRID\_RESOLUTION}$ and $N=\texttt{GRID\_SIZE}$.
+
+\subsection{Red Wall Segment Marking (from code)}
+\textbf{Function:} \texttt{detect\_red\_to\_grid()}
+After computing the red hit point $(h_x,h_y)$ at depth $d$, the code draws an \textbf{inward} obstacle segment of length $L=\texttt{segment\_len\_m}$:
+\[
+L'=\min(L,d)
+\]
+\[
+(s_x,s_y)=(h_x,h_y)-L'(\cos\alpha,\sin\alpha)
+\]
+The segment is rasterized on the grid (Bresenham-like loop) and each traversed cell is marked as \texttt{CELL\_OBSTACLE}.
+
+% =========================================================
+\section{Pillar Detection and Target Marking}
+\textbf{Key functions:} \texttt{find\_color\_centroid()}, \texttt{depth\_at\_centroid()},
+\texttt{clear\_all\_pillars\_of\_type()} \\
+\textbf{Main logic location:} \texttt{STATE\_MARKING\_PILLARS} (inside the state machine)
+
+\begin{enumerate}[leftmargin=2em]
+  \item detect and navigate to \textbf{blue} pillar
+  \item then detect and navigate to \textbf{yellow} pillar
+\end{enumerate}
+
+\subsection{Marking Procedure}
+In \texttt{STATE\_MARKING\_PILLARS}, the robot:
+\begin{enumerate}[leftmargin=2em]
+  \item stops motion and resets controllers,
+  \item computes the color centroid in the RGB camera,
+  \item computes depth at the centroid,
+  \item aligns the blob to the image center (optional, skipped if too close),
+  \item collects multiple world coordinate samples,
+  \item averages samples and converts to grid,
+  \item clears previous pillar marks and paints a disk of pillar cells.
+\end{enumerate}
+
+\subsection{Depth-Failure}
+If depth is invalid (often when too close), the controller can mark a pillar once using a constant fallback distance (\texttt{FALLBACK\_DIST\_M}) and exit marking to avoid deadlock.
+
+% =========================================================
+\section{Navigation to Targets and Waypoint Following}
+\textbf{Key functions:} \texttt{ensure\_path\_to\_goal()}, \texttt{follow\_path()},
+\texttt{diff\_drive()}, \texttt{pid\_rotate()}, \texttt{pid\_translate()}, \texttt{apply\_slew\_limiter()}
+
+\subsection{Path Planning to Goal}
+\texttt{ensure\_path\_to\_goal()} plans or replans periodically from the robot's current cell to the goal cell. Replanning is throttled by \texttt{NAV\_REPLAN\_EVERY}.
+
+\subsection{Waypoint Execution}
+\texttt{follow\_path()} steps through \texttt{GridPath}:
+\begin{itemize}[leftmargin=2em]
+  \item skips waypoints that are too close,
+  \item sends current waypoint into \texttt{diff\_drive()},
+  \item advances to next waypoint when reached.
+\end{itemize}
+
+\subsection{Differential Drive with PID and Hysteresis}
+\texttt{diff\_drive()} computes heading error and distance error to the waypoint:
+\begin{itemize}[leftmargin=2em]
+  \item rotates in place until aligned (hysteresis to prevent oscillation),
+  \item translates forward using a velocity PID,
+  \item smooths acceleration with \texttt{apply\_slew\_limiter()}.
+\end{itemize}
+
+% =========================================================
+\section{Safety Manager and Recovery Behavior}
+\textbf{Key functions:} \texttt{safety\_update\_per\_tick()}, \texttt{safety\_read\_ir()},
+\texttt{safety\_mark\_front\_obstacle()}, \texttt{stop\_all\_motors()}, \texttt{set\_wheel\_speeds()}
+
+\subsection{Safety Inputs}
+The safety module monitors:
+\begin{itemize}[leftmargin=2em]
+  \item IR distances (\texttt{fl\_range}, \texttt{fr\_range})
+  \item robot pitch angle (prevents wall-climb and unstable mapping)
+\end{itemize}
+
+\subsection{Safety Outputs}
+Safety produces:
+\begin{itemize}[leftmargin=2em]
+  \item scaling factors for linear and angular velocity (\texttt{v\_scale}, \texttt{w\_scale})
+  \item hard stop override (\texttt{hard\_stop}) to bypass navigation
+  \item recovery behavior (backup, turn away, wait for clearance)
+\end{itemize}
+
+\subsection{Recovery State Machine}
+When critical conditions occur, the robot:
+\begin{enumerate}[leftmargin=2em]
+  \item stops
+  \item reverses for \texttt{BACKUP\_TIME\_SEC}
+  \item turns away from the obstacle side
+  \item waits until \texttt{FRONT\_CLEAR\_RESUME\_M} is satisfied
+\end{enumerate}
+Additionally, \texttt{safety\_mark\_front\_obstacle()} can paint virtual obstacles in front of the robot to prevent re-entering the same collision region.
+
+% =========================================================
+\section{Visualization and Debugging Display}
+\textbf{Key functions:} \texttt{render\_display\_with\_path()}, \texttt{draw\_path\_on\_display()},
+\texttt{display\_ir\_status()}, \texttt{frontier\_score\_to\_color()}, \texttt{cost\_to\_color()}
+
+The display shows:
+\begin{itemize}[leftmargin=2em]
+  \item occupancy grid and pillar markers
+  \item cost map heat visualization (inflation)
+  \item current planned path and active waypoint
+  \item detected frontiers (scored and highlighted)
+  \item safety state and IR distances
+\end{itemize}
+
+This visualization is essential for interpreting navigation failures and tuning thresholds.
+
+\end{document}
