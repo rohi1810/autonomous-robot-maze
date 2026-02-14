@@ -174,9 +174,4 @@ The robot will:
 - Multi-goal optimization  
 - Performance profiling for large-scale grids  
 
----
 
-## Author
-
-Rohan Italiya  
-Master’s Student – Autonomous Robotics
